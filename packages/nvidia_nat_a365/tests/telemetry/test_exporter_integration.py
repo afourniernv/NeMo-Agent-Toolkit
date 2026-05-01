@@ -336,8 +336,8 @@ class TestEnsureTokenFor:
         return _AgentTokenCache()
 
     @pytest.fixture
-    def exporter_with_auth_ref(self, mock_context_state, agent_token_cache):
-        """Create an A365OtelExporter backed by a real _AgentTokenCache and a stub auth_ref."""
+    def exporter_with_auth_ref(self, mock_context_state, agent_token_cache, mock_auth_provider):
+        """Create an A365OtelExporter backed by a real _AgentTokenCache, a stub auth_ref, and a mock builder."""
         from nat.data_models.component_ref import AuthenticationRef
 
         with patch(
@@ -346,6 +346,9 @@ class TestEnsureTokenFor:
             mock_exporter_instance = Mock()
             mock_exporter_instance.export = Mock(return_value=SpanExportResult.SUCCESS)
             mock_exporter_class.return_value = mock_exporter_instance
+
+            mock_builder = Mock()
+            mock_builder.get_auth_provider = AsyncMock(return_value=mock_auth_provider)
 
             exporter = A365OtelExporter(
                 agent_id="test-agent-123",
@@ -357,9 +360,11 @@ class TestEnsureTokenFor:
                 context_state=mock_context_state,
                 token_cache=agent_token_cache,
                 auth_ref=AuthenticationRef("test_auth"),
+                builder=mock_builder,
             )
 
             exporter._mock_a365_exporter_instance = mock_exporter_instance
+            exporter._mock_builder = mock_builder
             yield exporter
 
     @pytest.mark.asyncio
@@ -378,7 +383,8 @@ class TestEnsureTokenFor:
         span = create_mock_otel_span(name="test_span")
         await exporter_with_auth_ref.export_otel_spans([span])
 
-        # No builder interaction because the token is still valid.
+        # Auth path was NOT entered because is_expiring_soon returned False.
+        exporter_with_auth_ref._mock_builder.get_auth_provider.assert_not_called()
         assert exporter_with_auth_ref._auth_providers == {}
         exporter_with_auth_ref._mock_a365_exporter_instance.export.assert_called_once()
 
