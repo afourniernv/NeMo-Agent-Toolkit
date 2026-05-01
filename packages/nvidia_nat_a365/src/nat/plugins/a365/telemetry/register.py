@@ -17,7 +17,7 @@
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NoReturn, Protocol
 
 if TYPE_CHECKING:
     from nat.data_models.authentication import AuthResult
@@ -100,7 +100,7 @@ def _get_token_extractor(name: str | None) -> Callable[["AuthResult"], str | Non
     return _TOKEN_EXTRACTOR_REGISTRY[name]
 
 
-def _raise_no_bearer_token(auth_result: "AuthResult") -> None:
+def _raise_no_bearer_token(auth_result: "AuthResult") -> NoReturn:
     """Raise A365AuthenticationError with a clear message when no token could be extracted."""
     found = [type(c).__name__ for c in auth_result.credentials]
     raise A365AuthenticationError(
@@ -191,10 +191,42 @@ class A365TelemetryExporter(BatchConfigMixin, TelemetryExporterBaseConfig, name=
     BearerTokenCred or HeaderCred(Authorization). For other credential shapes,
     register a custom token extractor with register_token_extractor(name, callable)
     and set token_extractor=name.
+
+    Identity: when wired through the A365 front-end, each turn's agent and tenant
+    ids are sourced from ``context.activity.get_agentic_instance_id()`` and
+    ``context.activity.get_agentic_tenant_id()``. The ``agent_id`` and ``tenant_id``
+    fields below are fallbacks used only when no per-turn identity is available
+    (e.g., CLI workflows or non-agentic activities).
+
+    Limitations to be aware of:
+
+    - **Single auth provider**: ``token_resolver`` is a single ``AuthenticationRef``
+      whose MSAL ``client_id`` becomes the ``appid`` claim of every emitted token.
+      Hosting multiple A365 agents with distinct app registrations in the same
+      process is not currently supported — only the agent matching the auth
+      provider's ``client_id`` will pass A365's token-validation check.
+    - **Cross-turn batching**: identity is read at export time from a contextvar.
+      ``BatchingProcessor`` schedules a flush task on first enqueue; that task
+      inherits a copy of the contextvar at creation time. Spans queued by later
+      turns into the same batch are exported under the first turn's identity.
+      For single-bot deployments this is invisible; for multi-bot deployments
+      it can intermittently misattribute telemetry.
     """
 
-    agent_id: str = Field(description="The Agent 365 agent ID")
-    tenant_id: str = Field(description="The Azure tenant ID")
+    agent_id: str | None = Field(
+        default=None,
+        description=(
+            "Fallback Agent 365 agent ID, used when the front-end cannot supply a per-turn "
+            "identity via ``set_turn_identity``. Required for non-agentic / CLI workflows."
+        ),
+    )
+    tenant_id: str | None = Field(
+        default=None,
+        description=(
+            "Fallback Azure tenant ID, used when the front-end cannot supply a per-turn "
+            "identity via ``set_turn_identity``. Required for non-agentic / CLI workflows."
+        ),
+    )
     token_resolver: AuthenticationRef = Field(
         description="Reference to NAT auth provider for token resolution (e.g., 'a365_auth')"
     )

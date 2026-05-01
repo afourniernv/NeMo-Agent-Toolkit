@@ -18,10 +18,13 @@ when stamping span attributes and when looking up the cached token.
 from __future__ import annotations
 
 import contextlib
+import logging
 from collections.abc import Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _AGENTIC_ROLES = frozenset({"agenticIdentity", "agenticUser"})
 
@@ -61,6 +64,13 @@ def _call_if_callable(obj: Any, name: str) -> Any:
         try:
             return fn()
         except Exception:
+            # Method exists but threw — surface it so silent fallback to static config is observable.
+            logger.warning(
+                "A365 turn-identity extraction: %s.%s() raised; falling back to None",
+                type(obj).__name__,
+                name,
+                exc_info=True,
+            )
             return None
     return None
 
@@ -86,6 +96,11 @@ def extract_identity_from_activity(activity: Any) -> A365TurnIdentity | None:
         try:
             agentic = bool(is_agentic_method())
         except Exception:
+            logger.warning(
+                "A365 turn-identity extraction: %s.is_agentic_request() raised; treating as non-agentic",
+                type(activity).__name__,
+                exc_info=True,
+            )
             agentic = False
     else:
         agentic = _is_agentic_via_role(activity)

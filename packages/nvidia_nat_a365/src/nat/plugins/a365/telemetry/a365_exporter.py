@@ -50,13 +50,13 @@ class _ReadableSpanAdapter:
 
     """
 
-    def __init__(self, otel_span: OtelSpan, tenant_id: str, agent_id: str):
+    def __init__(self, otel_span: OtelSpan, tenant_id: str | None, agent_id: str | None):
         """Initialize the adapter.
 
         Args:
             otel_span: The OtelSpan to adapt
-            tenant_id: The tenant ID to add as an attribute
-            agent_id: The agent ID to add as an attribute
+            tenant_id: Fallback tenant ID (used when no per-turn identity is set)
+            agent_id: Fallback agent ID (used when no per-turn identity is set)
         """
         self.context = otel_span.get_span_context()
 
@@ -115,7 +115,9 @@ class _ReadableSpanAdapter:
         self.resource = otel_span.resource
 
 
-def _convert_otel_span_to_readable(otel_span: OtelSpan, tenant_id: str, agent_id: str) -> _ReadableSpanAdapter:
+def _convert_otel_span_to_readable(
+    otel_span: OtelSpan, tenant_id: str | None, agent_id: str | None
+) -> _ReadableSpanAdapter:
     """Convert an OtelSpan to a ReadableSpan-compatible adapter for A365 exporter.
 
     A365's Agent365Exporter expects ReadableSpan objects with specific attributes.
@@ -123,8 +125,8 @@ def _convert_otel_span_to_readable(otel_span: OtelSpan, tenant_id: str, agent_id
 
     Args:
         otel_span: The OtelSpan to convert
-        tenant_id: The tenant ID to add as an attribute
-        agent_id: The agent ID to add as an attribute
+        tenant_id: Fallback tenant ID (used when no per-turn identity is set)
+        agent_id: Fallback agent ID (used when no per-turn identity is set)
 
     Returns:
         _ReadableSpanAdapter object that mimics ReadableSpan interface
@@ -156,8 +158,8 @@ class A365OtelExporter(OtelSpanExporter):
 
     def __init__(
         self,
-        agent_id: str,
-        tenant_id: str,
+        agent_id: str | None,
+        tenant_id: str | None,
         token_resolver: Callable[[str, str], str | None] | None,
         cluster_category: str = "prod",
         use_s2s_endpoint: bool = False,
@@ -294,6 +296,21 @@ class A365OtelExporter(OtelSpanExporter):
             else self._tenant_id
         )
 
+        # Without identity, the SDK's partition_by_identity drops every span silently.
+        # Surface that explicitly so misconfiguration / missing turn-identity is observable.
+        if not effective_agent_id or not effective_tenant_id:
+            logger.warning(
+                "A365 export skipped for %d span(s): missing agent identity "
+                "(turn=%s, fallback agent_id=%r, fallback tenant_id=%r). "
+                "Configure A365TelemetryExporter.agent_id / tenant_id, or ensure "
+                "the front-end publishes turn identity via set_turn_identity().",
+                len(spans),
+                turn,
+                self._agent_id,
+                self._tenant_id,
+            )
+            return
+
         await self._ensure_token_for(effective_agent_id, effective_tenant_id)
 
         try:
@@ -311,8 +328,9 @@ class A365OtelExporter(OtelSpanExporter):
                 f"(tenant={effective_tenant_id}, agent={effective_agent_id})"
             )
 
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._a365_exporter.export, readable_spans)
+            await asyncio.get_running_loop().run_in_executor(
+                None, self._a365_exporter.export, readable_spans
+            )
 
             logger.debug(
                 f"A365 exporter: successfully exported {len(readable_spans)} spans "
