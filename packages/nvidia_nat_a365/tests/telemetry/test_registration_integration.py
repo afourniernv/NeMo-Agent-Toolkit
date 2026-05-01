@@ -81,7 +81,7 @@ class TestRegistrationIntegration:
                     assert exporter._agent_id == "test-agent-123"
                     assert exporter._tenant_id == "test-tenant-456"
                     assert exporter._token_resolver is not None
-                    assert exporter._auth_provider is None
+                    assert exporter._auth_providers == {}
                     assert exporter._auth_ref == config.token_resolver
                     assert exporter._builder is mock_builder
                     assert exporter._token_cache is not None
@@ -101,7 +101,8 @@ class TestRegistrationIntegration:
                     mock_span.parent = None
                     await exporter.export_otel_spans([mock_span])
                     mock_builder.get_auth_provider.assert_called_once_with(config.token_resolver)
-                    assert exporter._auth_provider is mock_auth_provider
+                    assert ("test-agent-123", "test-tenant-456") in exporter._auth_providers
+                    assert exporter._auth_providers[("test-agent-123", "test-tenant-456")] is mock_auth_provider
 
     @pytest.mark.asyncio
     async def test_registration_passes_all_config_to_exporter(

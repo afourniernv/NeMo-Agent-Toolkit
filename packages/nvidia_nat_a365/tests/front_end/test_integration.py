@@ -1055,17 +1055,17 @@ class TestErrorHandlingInCreateAgentApplication:
     async def test_agent_application_application_error_raises_a365_sdk_error(self, full_config):
         """Test that ApplicationError from AgentApplication raises A365SDKError."""
         from nat.plugins.a365.exceptions import A365SDKError
-        
+
         # Mock ApplicationError
         class MockApplicationError(Exception):
             pass
-        
+
         worker = A365FrontEndPluginWorker(full_config)
         mock_storage = Mock()
         mock_connection_manager = Mock()
         mock_adapter = Mock()
         mock_authorization = Mock()
-        
+
         with patch.object(worker, "_get_storage", return_value=mock_storage):
             with patch.object(worker, "_get_connection_manager", return_value=mock_connection_manager):
                 # Patch SDK components at their import source
@@ -1077,8 +1077,71 @@ class TestErrorHandlingInCreateAgentApplication:
                                 return cls
                             def __new__(cls, *args, **kwargs):
                                 raise MockApplicationError("SDK app error")
-                        
+
                         with patch("microsoft_agents.hosting.core.AgentApplication", MockAgentApplication, create=True):
                             with patch("microsoft_agents.hosting.core.app.app_error.ApplicationError", MockApplicationError):
                                 with pytest.raises(A365SDKError, match="Failed to create AgentApplication"):
                                     await worker.create_agent_application()
+
+
+async def test_worker_publishes_turn_identity_during_message_handler():
+    """on_message must set the A365 turn identity for the workflow body."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from nat.plugins.a365.turn_context import (
+        A365TurnIdentity,
+        get_turn_identity,
+    )
+
+    captured: dict = {}
+
+    class FakeRunner:
+        async def __aenter__(self):
+            captured["identity_during_run"] = get_turn_identity()
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def result(self, to_type=str):
+            return "hello"
+
+    fake_session_manager = SimpleNamespace(
+        run=lambda payload: FakeRunner(),
+    )
+
+    worker = A365FrontEndPluginWorker.__new__(A365FrontEndPluginWorker)
+    worker.full_config = SimpleNamespace(general=SimpleNamespace(front_end=SimpleNamespace()))
+    worker.front_end_config = worker.full_config.general.front_end
+
+    registered: dict = {}
+
+    class FakeApp:
+        def activity(self, kind):
+            def decorator(fn):
+                registered[kind] = fn
+                return fn
+            return decorator
+
+    await worker.setup_message_handlers(FakeApp(), fake_session_manager)
+
+    activity = SimpleNamespace(
+        text="hi",
+        is_agentic_request=lambda: True,
+        get_agentic_instance_id=lambda: "turn-agent",
+        get_agentic_tenant_id=lambda: "turn-tenant",
+        get_agentic_user=lambda: "user-1",
+    )
+    context = SimpleNamespace(activity=activity, send_activity=AsyncMock())
+
+    handler = registered["message"]
+    await handler(context, state=Mock())
+
+    assert captured["identity_during_run"] == A365TurnIdentity(
+        agent_app_id="turn-agent",
+        tenant_id="turn-tenant",
+        on_behalf_user_id="user-1",
+    )
+    # And it must be reset after the handler returns.
+    assert get_turn_identity() is None
