@@ -522,6 +522,7 @@ def test_readable_span_adapter_falls_back_to_static_when_no_turn():
     assert adapter.attributes[TENANT_ID_KEY] == "static-tenant"
 
 
+@pytest.mark.asyncio
 async def test_export_uses_turn_identity_for_token_lookup():
     """Span attributes and the token-cache key must use turn-context identity."""
     from microsoft_agents_a365.observability.core.constants import (
