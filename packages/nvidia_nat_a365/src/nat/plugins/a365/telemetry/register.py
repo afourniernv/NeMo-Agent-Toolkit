@@ -180,6 +180,80 @@ class _TokenCache:
             return expires_utc <= buffer_time
 
 
+class _AgentTokenCache:
+    """Thread-safe token cache keyed by ``(agent_id, tenant_id)``.
+
+    A process can host multiple A365 agents in the same workflow; each agent's
+    bearer token must be tracked separately because the A365 backend partitions
+    telemetry by ``gen_ai.agent.id`` and validates the token's ``appid`` claim
+    against that route segment.
+    """
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        # key: (agent_id | None, tenant_id | None) -> (token, expires_at)
+        self._entries: dict[
+            tuple[str | None, str | None], tuple[str, datetime | None]
+        ] = {}
+
+    @staticmethod
+    def _expires_at_utc(expires_at: datetime | None) -> datetime | None:
+        if expires_at is None:
+            return None
+        if expires_at.tzinfo is not None:
+            return expires_at
+        local_tz = datetime.now().astimezone().tzinfo
+        return expires_at.replace(tzinfo=local_tz).astimezone(timezone.utc)
+
+    def get_token(
+        self, agent_id: str | None, tenant_id: str | None
+    ) -> str | None:
+        """Return cached token for the key if still valid (5 min buffer), else None."""
+        with self._lock:
+            entry = self._entries.get((agent_id, tenant_id))
+            if entry is None:
+                return None
+            token, expires_at = entry
+            expires_utc = self._expires_at_utc(expires_at)
+            if expires_utc is None:
+                return token
+            buffer_time = datetime.now(timezone.utc) + timedelta(minutes=5)
+            return token if expires_utc > buffer_time else None
+
+    def update_token(
+        self,
+        agent_id: str | None,
+        tenant_id: str | None,
+        *,
+        token: str,
+        expires_at: datetime | None,
+    ) -> None:
+        with self._lock:
+            self._entries[(agent_id, tenant_id)] = (token, expires_at)
+
+    def is_expiring_soon(
+        self,
+        agent_id: str | None,
+        tenant_id: str | None,
+        buffer_minutes: int = 5,
+    ) -> bool:
+        """True if the cached token is unset, expired, or expiring within ``buffer_minutes``."""
+        with self._lock:
+            entry = self._entries.get((agent_id, tenant_id))
+            if entry is None:
+                return True
+            _, expires_at = entry
+            expires_utc = self._expires_at_utc(expires_at)
+            if expires_utc is None:
+                return False
+            buffer_time = datetime.now(timezone.utc) + timedelta(
+                minutes=buffer_minutes
+            )
+            return expires_utc <= buffer_time
+
+
 async def _create_token_resolver_from_auth_ref(
     auth_ref: AuthenticationRef,
     builder: Builder,
