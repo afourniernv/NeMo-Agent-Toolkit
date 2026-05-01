@@ -17,7 +17,6 @@
 import asyncio
 import logging
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from microsoft_agents_a365.observability.core.exporters.agent365_exporter import (
@@ -286,8 +285,6 @@ class A365OtelExporter(OtelSpanExporter):
         """Export a list of OtelSpans using the A365 exporter."""
         if not spans:
             return
-
-        from nat.plugins.a365.turn_context import get_turn_identity
 
         turn = get_turn_identity()
         effective_agent_id = turn.agent_app_id if turn is not None else self._agent_id
