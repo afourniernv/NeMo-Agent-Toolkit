@@ -22,6 +22,10 @@ from datetime import datetime, timedelta, timezone
 from microsoft_agents_a365.observability.core.exporters.agent365_exporter import (
     Agent365Exporter,
 )
+from microsoft_agents_a365.observability.core.constants import (
+    GEN_AI_AGENT_ID_KEY,
+    TENANT_ID_KEY,
+)
 
 from nat.builder.context import ContextState
 from nat.plugins.a365.exceptions import A365AuthenticationError, A365SDKError
@@ -63,8 +67,8 @@ class _ReadableSpanAdapter:
 
         # Add tenant_id and agent_id to attributes (required for A365 partitioning)
         self.attributes = dict(otel_span.attributes)
-        self.attributes["tenant.id"] = tenant_id
-        self.attributes["gen_ai.agent.id"] = agent_id
+        self.attributes[TENANT_ID_KEY] = tenant_id
+        self.attributes[GEN_AI_AGENT_ID_KEY] = agent_id
 
         self.events = []
         for event in otel_span.events:

@@ -23,6 +23,10 @@ import pytest
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace.export import SpanExportResult
 from opentelemetry.trace import SpanContext, SpanKind, TraceFlags
+from microsoft_agents_a365.observability.core.constants import (
+    GEN_AI_AGENT_ID_KEY,
+    TENANT_ID_KEY,
+)
 
 from nat.builder.context import ContextState
 from nat.plugins.a365.telemetry.a365_exporter import A365OtelExporter, _ReadableSpanAdapter
@@ -144,8 +148,8 @@ class TestA365ExporterIntegration:
 
         # Verify span attributes were set correctly
         assert readable_span.name == "test_span_1"
-        assert readable_span.attributes["tenant.id"] == "test-tenant-456"
-        assert readable_span.attributes["gen_ai.agent.id"] == "test-agent-123"
+        assert readable_span.attributes[TENANT_ID_KEY] == "test-tenant-456"
+        assert readable_span.attributes[GEN_AI_AGENT_ID_KEY] == "test-agent-123"
         assert readable_span.context.trace_id == span.get_span_context().trace_id
         assert readable_span.context.span_id == span.get_span_context().span_id
 
@@ -188,8 +192,8 @@ class TestA365ExporterIntegration:
         assert readable_span.attributes["another.attr"] == 42
 
         # Verify A365-specific attributes are added
-        assert readable_span.attributes["tenant.id"] == "test-tenant-456"
-        assert readable_span.attributes["gen_ai.agent.id"] == "test-agent-123"
+        assert readable_span.attributes[TENANT_ID_KEY] == "test-tenant-456"
+        assert readable_span.attributes[GEN_AI_AGENT_ID_KEY] == "test-agent-123"
 
     @pytest.mark.asyncio
     async def test_span_conversion_with_events(self, a365_exporter):
@@ -295,6 +299,24 @@ class TestA365ExporterIntegration:
         readable_spans = call_args[0][0]
         assert isinstance(readable_spans, list)
         assert len(readable_spans) == 1
+
+
+def test_readable_span_adapter_uses_sdk_attribute_keys():
+    """Adapter must stamp keys that the A365 SDK's partitioner reads."""
+    from microsoft_agents_a365.observability.core.constants import (
+        GEN_AI_AGENT_ID_KEY,
+        TENANT_ID_KEY,
+    )
+
+    span = create_mock_otel_span(attributes={})
+    adapter = _ReadableSpanAdapter(
+        otel_span=span,
+        tenant_id="tenant-A",
+        agent_id="agent-A",
+    )
+
+    assert adapter.attributes[GEN_AI_AGENT_ID_KEY] == "agent-A"
+    assert adapter.attributes[TENANT_ID_KEY] == "tenant-A"
 
 
 class TestProactiveTokenRefresh:
