@@ -110,76 +110,6 @@ def _raise_no_bearer_token(auth_result: "AuthResult") -> None:
     )
 
 
-class _TokenCache:
-    """Thread-safe token cache for AuthenticationRef-based token resolvers."""
-
-    def __init__(self, token: str, expires_at: datetime | None):
-        """Initialize token cache.
-
-        Args:
-            token: Initial bearer token
-            expires_at: Token expiration time (UTC) or None if no expiration
-        """
-        import threading
-        self._lock = threading.Lock()
-        self._token = token
-        self._expires_at = expires_at
-
-    def _expires_at_utc(self) -> datetime | None:
-        """Return expiration as timezone-aware UTC for comparison.
-
-        If naive, assume local time (e.g. from provider using datetime.now() + delta).
-        """
-        if self._expires_at is None:
-            return None
-        if self._expires_at.tzinfo is not None:
-            return self._expires_at
-        local_tz = datetime.now().astimezone().tzinfo
-        return self._expires_at.replace(tzinfo=local_tz).astimezone(timezone.utc)
-
-    def get_token(self) -> str | None:
-        """Get cached token if still valid (with 5 minute buffer).
-
-        Returns:
-            Token string if valid, None if expired or expiring soon
-        """
-        with self._lock:
-            expires_utc = self._expires_at_utc()
-            if expires_utc is not None:
-                buffer_time = datetime.now(timezone.utc) + timedelta(minutes=5)
-                if expires_utc > buffer_time:
-                    return self._token
-                return None
-            return self._token
-
-    def update_token(self, token: str, expires_at: datetime | None) -> None:
-        """Update cached token.
-
-        Args:
-            token: New bearer token
-            expires_at: New expiration time (UTC) or None
-        """
-        with self._lock:
-            self._token = token
-            self._expires_at = expires_at
-
-    def is_expiring_soon(self, buffer_minutes: int = 5) -> bool:
-        """Check if token is expiring soon.
-
-        Args:
-            buffer_minutes: Minutes before expiration to consider "soon" (default: 5)
-
-        Returns:
-            True if token expires within buffer time, False otherwise
-        """
-        with self._lock:
-            expires_utc = self._expires_at_utc()
-            if expires_utc is None:
-                return False
-            buffer_time = datetime.now(timezone.utc) + timedelta(minutes=buffer_minutes)
-            return expires_utc <= buffer_time
-
-
 class _AgentTokenCache:
     """Thread-safe token cache keyed by ``(agent_id, tenant_id)``.
 
@@ -254,57 +184,6 @@ class _AgentTokenCache:
             return expires_utc <= buffer_time
 
 
-async def _create_token_resolver_from_auth_ref(
-    auth_ref: AuthenticationRef,
-    builder: Builder,
-) -> tuple[Callable[[str, str], str | None], object, _TokenCache]:
-    """Create a token resolver callable from an AuthenticationRef.
-
-    Creates a synchronous callable that returns cached tokens, with token refresh
-    handled proactively before export operations.
-
-    Args:
-        auth_ref: AuthenticationRef to resolve
-        builder: Builder instance for accessing auth providers
-
-    Returns:
-        Tuple of (token_resolver_callable, auth_provider_instance, token_cache)
-        - token_resolver_callable: Sync callable (agent_id, tenant_id) -> token | None
-        - auth_provider_instance: Auth provider for proactive token refresh
-        - token_cache: Token cache instance for updating tokens
-
-    Raises:
-        A365AuthenticationError: If authentication fails or no token available
-    """
-    auth_provider = await builder.get_auth_provider(auth_ref)
-
-    # Get user_id from context if available (needed for OAuth flows)
-    from nat.builder.context import Context
-    user_id = Context.get().user_id
-
-    auth_result = await auth_provider.authenticate(user_id=user_id)
-    if not auth_result.credentials:
-        raise A365AuthenticationError("No credentials available from auth provider")
-
-    extractor = _get_token_extractor(None)
-    token = extractor(auth_result)
-    if token is None:
-        _raise_no_bearer_token(auth_result)
-    expires_at = auth_result.token_expires_at
-
-    token_cache = _TokenCache(token, expires_at)
-
-    def token_resolver(agent_id: str, tenant_id: str) -> str | None:
-        """Synchronous token resolver callable for SDK.
-
-        Returns cached token if valid (with 5 minute buffer), None if expired.
-        Token refresh is handled proactively before export operations.
-        """
-        return token_cache.get_token()
-
-    return token_resolver, auth_provider, token_cache
-
-
 class A365TelemetryExporter(BatchConfigMixin, TelemetryExporterBaseConfig, name="a365"):
     """A telemetry exporter to transmit traces to Microsoft Agent 365 backend.
 
@@ -341,36 +220,37 @@ class A365TelemetryExporter(BatchConfigMixin, TelemetryExporterBaseConfig, name=
 async def a365_telemetry_exporter(config: A365TelemetryExporter, builder: Builder):
     """Create an Agent 365 telemetry exporter.
 
-    Integrates A365's Agent365Exporter with NAT's telemetry system to send
-    OpenTelemetry spans to Microsoft Agent 365 backend endpoints.
-
-    Auth is resolved lazily on first export (not at build time) because
-    telemetry exporters are built in WorkflowBuilder.__aenter__ before
-    auth providers exist. This keeps core unchanged; the plugin handles
-    the timing constraint locally.
+    Auth resolution is deferred to first use of a given (agent_id, tenant_id)
+    pair: the synchronous SDK callback returns whatever is in the cache, and
+    the async helper on A365OtelExporter populates / refreshes entries before
+    each export. This supports multi-agent processes (one cache entry per
+    serving agent) and keeps WorkflowBuilder.__aenter__ free of auth I/O.
     """
     from nat.plugins.a365.telemetry.a365_exporter import A365OtelExporter
 
     token_extractor_fn = _get_token_extractor(config.token_extractor)
-
-    # Defer auth: do not call get_auth_provider here (not available yet in __aenter__).
-    token_cache = _TokenCache(None, None)
+    token_cache = _AgentTokenCache()
 
     def token_resolver(agent_id: str, tenant_id: str) -> str | None:
-        """Sync callable for SDK; returns cached token (filled on first export)."""
-        return token_cache.get_token()
+        """Sync callable for the A365 SDK; returns cached bearer for the key.
+
+        The async refresh path on A365OtelExporter ensures the cache is filled
+        before the SDK calls this on each export.
+        """
+        return token_cache.get_token(agent_id, tenant_id)
 
     logger.info(
-        f"A365 telemetry exporter initialized for agent_id={config.agent_id}, "
-        f"tenant_id={config.tenant_id}, cluster={config.cluster_category}, "
-        f"token_resolver=deferred (auth resolved on first export)"
+        "A365 telemetry exporter initialized for agent_id=%s, tenant_id=%s, "
+        "cluster=%s, token_resolver=deferred (auth resolved per-agent on export)",
+        config.agent_id,
+        config.tenant_id,
+        config.cluster_category,
     )
 
     exporter = A365OtelExporter(
         agent_id=config.agent_id,
         tenant_id=config.tenant_id,
         token_resolver=token_resolver,
-        auth_provider=None,
         token_cache=token_cache,
         auth_ref=config.token_resolver,
         builder=builder,

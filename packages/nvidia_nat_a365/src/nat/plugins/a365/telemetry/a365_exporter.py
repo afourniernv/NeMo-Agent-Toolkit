@@ -18,6 +18,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from microsoft_agents_a365.observability.core.exporters.agent365_exporter import (
     Agent365Exporter,
@@ -33,6 +34,7 @@ from nat.plugins.a365.telemetry.register import (
     _get_token_extractor,
     _raise_no_bearer_token,
 )
+from nat.plugins.a365.turn_context import get_turn_identity
 from nat.plugins.opentelemetry.otel_span import OtelSpan
 from nat.plugins.opentelemetry.otel_span_exporter import OtelSpanExporter
 from opentelemetry.sdk.trace import Event as OtelEvent
@@ -65,10 +67,17 @@ class _ReadableSpanAdapter:
         else:
             self.parent = None
 
-        # Add tenant_id and agent_id to attributes (required for A365 partitioning)
+        # Per-turn identity wins over static config; falls back when not in a turn.
+        turn = get_turn_identity()
+        effective_agent_id = turn.agent_app_id if turn is not None else agent_id
+        effective_tenant_id = (
+            turn.tenant_id if turn is not None and turn.tenant_id is not None
+            else tenant_id
+        )
+
         self.attributes = dict(otel_span.attributes)
-        self.attributes[TENANT_ID_KEY] = tenant_id
-        self.attributes[GEN_AI_AGENT_ID_KEY] = agent_id
+        self.attributes[TENANT_ID_KEY] = effective_tenant_id
+        self.attributes[GEN_AI_AGENT_ID_KEY] = effective_agent_id
 
         self.events = []
         for event in otel_span.events:
@@ -161,7 +170,6 @@ class A365OtelExporter(OtelSpanExporter):
         drop_on_overflow: bool = False,
         shutdown_timeout: float = 10.0,
         resource_attributes: dict[str, str] | None = None,
-        auth_provider=None,
         token_cache=None,
         auth_ref=None,
         builder=None,
@@ -187,13 +195,15 @@ class A365OtelExporter(OtelSpanExporter):
         self._cluster_category = cluster_category
         self._use_s2s_endpoint = use_s2s_endpoint
         self._suppress_invoke_agent_input = suppress_invoke_agent_input
-        self._auth_provider = auth_provider
         self._token_cache = token_cache
         self._auth_ref = auth_ref
         self._builder = builder
-        self._auth_resolve_lock = asyncio.Lock()
+        # One auth provider per (agent_id, tenant_id) key, lazily resolved.
+        self._auth_providers: dict[tuple[str | None, str | None], Any] = {}
+        self._auth_locks: dict[tuple[str | None, str | None], asyncio.Lock] = {}
+        self._auth_locks_guard = asyncio.Lock()
 
-        # SDK requires token_resolver to be non-None, so if None is passed, SDK will raise ValueError
+        # SDK requires token_resolver to be non-None.
         self._a365_exporter = Agent365Exporter(
             token_resolver=token_resolver,
             cluster_category=cluster_category,
@@ -205,139 +215,130 @@ class A365OtelExporter(OtelSpanExporter):
             f"tenant_id={tenant_id}, cluster={cluster_category}"
         )
 
-    async def _resolve_auth_once(self) -> None:
-        """Resolve auth provider and fill token cache on first export (lazy).
+    async def _ensure_token_for(self, agent_id: str, tenant_id: str) -> None:
+        """Populate or refresh the cached bearer for ``(agent_id, tenant_id)``.
 
-        Telemetry is built in __aenter__ before auth exists; by first export,
-        populate_builder has run so we can resolve here. Keeps core unchanged.
+        Called from ``export_otel_spans`` for the identity stamped on the
+        spans being exported. Skips the call when the cached token is still
+        valid with a 5-minute buffer.
         """
-        if self._auth_provider is not None or self._auth_ref is None or self._builder is None:
+        if (
+            self._token_cache is None
+            or self._auth_ref is None
+            or self._builder is None
+        ):
             return
-        if self._token_cache is None:
+
+        key = (agent_id, tenant_id)
+        if not self._token_cache.is_expiring_soon(agent_id, tenant_id):
             return
-        async with self._auth_resolve_lock:
-            if self._auth_provider is not None:
+
+        lock = self._auth_locks.get(key)
+        if lock is None:
+            async with self._auth_locks_guard:
+                lock = self._auth_locks.setdefault(key, asyncio.Lock())
+
+        async with lock:
+            if not self._token_cache.is_expiring_soon(agent_id, tenant_id):
                 return
+
             try:
-                auth_provider = await self._builder.get_auth_provider(self._auth_ref)
                 from nat.builder.context import Context
+
+                auth_provider = self._auth_providers.get(key)
+                if auth_provider is None:
+                    auth_provider = await self._builder.get_auth_provider(self._auth_ref)
+                    self._auth_providers[key] = auth_provider
+
                 user_id = Context.get().user_id
                 auth_result = await auth_provider.authenticate(user_id=user_id)
                 if not auth_result.credentials:
-                    raise A365AuthenticationError("No credentials available from auth provider")
+                    raise A365AuthenticationError(
+                        "No credentials available from auth provider"
+                    )
+
                 token = self._token_extractor(auth_result)
                 if token is None:
                     _raise_no_bearer_token(auth_result)
-                self._token_cache.update_token(token, auth_result.token_expires_at)
-                self._auth_provider = auth_provider
-            except Exception as e:
+
+                self._token_cache.update_token(
+                    agent_id,
+                    tenant_id,
+                    token=token,
+                    expires_at=auth_result.token_expires_at,
+                )
+                logger.debug(
+                    "A365 token resolved for agent=%s tenant=%s (expires_at=%s)",
+                    agent_id,
+                    tenant_id,
+                    auth_result.token_expires_at,
+                )
+            except Exception:
                 logger.error(
-                    f"Failed to resolve auth on first export (agent_id={self._agent_id}, "
-                    f"tenant_id={self._tenant_id}): {e}",
+                    "Failed to resolve A365 token for agent=%s tenant=%s",
+                    agent_id,
+                    tenant_id,
                     exc_info=True,
                 )
                 raise
 
-    async def _refresh_token_if_needed(self) -> None:
-        """Refresh token proactively if it's expiring soon.
-
-        Only refreshes if using AuthenticationRef-based token resolver.
-        """
-        if self._auth_provider is None or self._token_cache is None:
-            return
-
-        if not self._token_cache.is_expiring_soon(buffer_minutes=5):
-            return
-
-        try:
-            from nat.builder.context import Context
-            user_id = Context.get().user_id
-
-            logger.debug(
-                f"Refreshing token proactively (agent_id={self._agent_id}, tenant_id={self._tenant_id})"
-            )
-            auth_result = await self._auth_provider.authenticate(user_id=user_id)
-            if not auth_result.credentials:
-                logger.warning("Token refresh failed: no credentials available")
-                return
-
-            token = self._token_extractor(auth_result)
-            if token is None:
-                logger.warning(
-                    f"No bearer token found in refreshed credentials. "
-                    f"Found credential types: {[type(c).__name__ for c in auth_result.credentials]}"
-                )
-                return
-            expires_at = auth_result.token_expires_at
-            self._token_cache.update_token(token, expires_at)
-
-            logger.debug(
-                f"Token refreshed successfully (expires_at={expires_at}, "
-                f"agent_id={self._agent_id}, tenant_id={self._tenant_id})"
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed to refresh token proactively (agent_id={self._agent_id}, "
-                f"tenant_id={self._tenant_id}): {e}. Export may fail if token is expired."
-            )
-
     async def export_otel_spans(self, spans: list[OtelSpan]) -> None:
-        """Export a list of OtelSpans using the A365 exporter.
-
-        Converts OtelSpans to ReadableSpan format and exports via A365's Agent365Exporter.
-        Uses asyncio.run_in_executor to bridge NAT's async interface with A365's sync exporter.
-
-        Args:
-            spans (list[OtelSpan]): The list of spans to export.
-
-        Raises:
-            Exception: If there's an error during span export (logged but not re-raised).
-        """
+        """Export a list of OtelSpans using the A365 exporter."""
         if not spans:
             return
 
-        await self._resolve_auth_once()
-        await self._refresh_token_if_needed()
+        from nat.plugins.a365.turn_context import get_turn_identity
+
+        turn = get_turn_identity()
+        effective_agent_id = turn.agent_app_id if turn is not None else self._agent_id
+        effective_tenant_id = (
+            turn.tenant_id
+            if turn is not None and turn.tenant_id is not None
+            else self._tenant_id
+        )
+
+        await self._ensure_token_for(effective_agent_id, effective_tenant_id)
 
         try:
-            readable_spans = []
-            for otel_span in spans:
-                readable_span = _convert_otel_span_to_readable(
+            readable_spans = [
+                _convert_otel_span_to_readable(
                     otel_span=otel_span,
-                    tenant_id=self._tenant_id,
-                    agent_id=self._agent_id,
+                    tenant_id=effective_tenant_id,
+                    agent_id=effective_agent_id,
                 )
-                readable_spans.append(readable_span)
+                for otel_span in spans
+            ]
 
             logger.debug(
                 f"A365 exporter: converted {len(spans)} OtelSpans to ReadableSpan format "
-                f"(tenant={self._tenant_id}, agent={self._agent_id})"
+                f"(tenant={effective_tenant_id}, agent={effective_agent_id})"
             )
 
-            # Bridge async/sync: A365's Agent365Exporter.export() is synchronous
-            # Run it in a thread pool executor to avoid blocking the event loop
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._a365_exporter.export, readable_spans)
 
             logger.debug(
                 f"A365 exporter: successfully exported {len(readable_spans)} spans "
-                f"(tenant={self._tenant_id}, agent={self._agent_id})"
+                f"(tenant={effective_tenant_id}, agent={effective_agent_id})"
             )
         except Exception as e:
             error_msg = str(e).lower()
             logger.error(
-                f"Error exporting spans to A365 (tenant={self._tenant_id}, agent={self._agent_id}): {e}",
+                f"Error exporting spans to A365 (tenant={effective_tenant_id}, "
+                f"agent={effective_agent_id}): {e}",
                 exc_info=True,
             )
-            # Check if it's an authentication error (token resolver failure)
-            if "authentication" in error_msg or "unauthorized" in error_msg or "token" in error_msg:
+            if (
+                "authentication" in error_msg
+                or "unauthorized" in error_msg
+                or "token" in error_msg
+            ):
                 raise A365AuthenticationError(
                     f"Authentication failed while exporting telemetry: {str(e)}",
-                    original_error=e
+                    original_error=e,
                 ) from e
-            else:
-                raise A365SDKError(
-                    f"Failed to export spans to A365: {str(e)}",
-                    sdk_component="Agent365Exporter",
-                    original_error=e
-                ) from e
+            raise A365SDKError(
+                f"Failed to export spans to A365: {str(e)}",
+                sdk_component="Agent365Exporter",
+                original_error=e,
+            ) from e

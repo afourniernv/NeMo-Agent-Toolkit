@@ -319,30 +319,27 @@ def test_readable_span_adapter_uses_sdk_attribute_keys():
     assert adapter.attributes[TENANT_ID_KEY] == "tenant-A"
 
 
-class TestProactiveTokenRefresh:
-    """Tests for proactive token refresh in A365OtelExporter."""
+class TestEnsureTokenFor:
+    """Tests for per-key lazy token resolution in A365OtelExporter._ensure_token_for."""
 
     @pytest.fixture
     def mock_auth_provider(self):
-        """Create a mock auth provider for token refresh."""
+        """Create a mock auth provider."""
         provider = Mock()
         provider.authenticate = AsyncMock()
         return provider
 
     @pytest.fixture
-    def mock_token_cache(self):
-        """Create a mock token cache."""
-        from nat.plugins.a365.telemetry.register import _TokenCache
-
-        cache = Mock(spec=_TokenCache)
-        cache.is_expiring_soon = Mock(return_value=False)
-        cache.update_token = Mock()
-        cache.get_token = Mock(return_value="cached_token_123")
-        return cache
+    def agent_token_cache(self):
+        """Create a real _AgentTokenCache for testing."""
+        from nat.plugins.a365.telemetry.register import _AgentTokenCache
+        return _AgentTokenCache()
 
     @pytest.fixture
-    def exporter_with_auth_ref(self, mock_context_state, mock_auth_provider, mock_token_cache):
-        """Create an A365OtelExporter with AuthenticationRef-based auth."""
+    def exporter_with_auth_ref(self, mock_context_state, agent_token_cache):
+        """Create an A365OtelExporter backed by a real _AgentTokenCache and a stub auth_ref."""
+        from nat.data_models.component_ref import AuthenticationRef
+
         with patch(
             "nat.plugins.a365.telemetry.a365_exporter.Agent365Exporter"
         ) as mock_exporter_class:
@@ -353,102 +350,224 @@ class TestProactiveTokenRefresh:
             exporter = A365OtelExporter(
                 agent_id="test-agent-123",
                 tenant_id="test-tenant-456",
-                token_resolver=lambda a, t: "token",
+                token_resolver=lambda a, t: agent_token_cache.get_token(a, t),
                 cluster_category="prod",
                 use_s2s_endpoint=False,
                 suppress_invoke_agent_input=False,
                 context_state=mock_context_state,
-                auth_provider=mock_auth_provider,
-                token_cache=mock_token_cache,
+                token_cache=agent_token_cache,
+                auth_ref=AuthenticationRef("test_auth"),
             )
 
             exporter._mock_a365_exporter_instance = mock_exporter_instance
             yield exporter
 
     @pytest.mark.asyncio
-    async def test_no_refresh_when_token_not_expiring(self, exporter_with_auth_ref, mock_token_cache):
-        """Test that token is not refreshed when not expiring soon."""
-        span = create_mock_otel_span(name="test_span")
-        mock_token_cache.is_expiring_soon.return_value = False
+    async def test_no_refresh_when_token_not_expiring(self, exporter_with_auth_ref, agent_token_cache):
+        """Token is not refreshed when the cache entry is still valid."""
+        from datetime import datetime, timedelta, timezone
 
+        # Pre-fill the cache with a token that won't expire for 30 minutes.
+        agent_token_cache.update_token(
+            "test-agent-123",
+            "test-tenant-456",
+            token="cached_token_123",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        )
+
+        span = create_mock_otel_span(name="test_span")
         await exporter_with_auth_ref.export_otel_spans([span])
 
-        # Auth provider should not be called
-        exporter_with_auth_ref._auth_provider.authenticate.assert_not_called()
-        # Token cache update should not be called
-        mock_token_cache.update_token.assert_not_called()
+        # No builder interaction because the token is still valid.
+        assert exporter_with_auth_ref._auth_providers == {}
+        exporter_with_auth_ref._mock_a365_exporter_instance.export.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_refresh_when_token_expiring_soon(self, exporter_with_auth_ref, mock_token_cache):
-        """Test that token is refreshed when expiring soon."""
+    async def test_refresh_when_token_expiring_soon(
+        self, exporter_with_auth_ref, agent_token_cache, mock_auth_provider
+    ):
+        """Token is refreshed (per key) when the cache entry is about to expire."""
         from datetime import datetime, timedelta, timezone
         from pydantic import SecretStr
-
-        span = create_mock_otel_span(name="test_span")
-        mock_token_cache.is_expiring_soon.return_value = True
-
-        # Mock successful token refresh
         from nat.data_models.authentication import AuthResult, BearerTokenCred
+
+        # Pre-fill with an already-expired token so is_expiring_soon returns True.
+        agent_token_cache.update_token(
+            "test-agent-123",
+            "test-tenant-456",
+            token="old_token",
+            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        )
 
         new_token = BearerTokenCred(token=SecretStr("new_token_456"))
         auth_result = Mock(spec=AuthResult)
         auth_result.credentials = [new_token]
-        auth_result.token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+        auth_result.token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=60)
+        mock_auth_provider.authenticate.return_value = auth_result
 
-        exporter_with_auth_ref._auth_provider.authenticate.return_value = auth_result
+        # Wire the mock auth provider into the builder mock on the exporter.
+        mock_builder = Mock()
+        mock_builder.get_auth_provider = AsyncMock(return_value=mock_auth_provider)
+        exporter_with_auth_ref._builder = mock_builder
 
         with patch("nat.builder.context.Context") as mock_context_class:
             mock_context_instance = Mock()
             mock_context_instance.user_id = "test_user"
             mock_context_class.get.return_value = mock_context_instance
 
+            span = create_mock_otel_span(name="test_span")
             await exporter_with_auth_ref.export_otel_spans([span])
 
-            # Auth provider should be called
-            exporter_with_auth_ref._auth_provider.authenticate.assert_called_once()
-            # Token cache should be updated
-            mock_token_cache.update_token.assert_called_once_with("new_token_456", auth_result.token_expires_at)
+        # Auth provider should be stored for the key.
+        key = ("test-agent-123", "test-tenant-456")
+        assert key in exporter_with_auth_ref._auth_providers
+        assert exporter_with_auth_ref._auth_providers[key] is mock_auth_provider
+        # Cache should have the new token.
+        assert agent_token_cache.get_token("test-agent-123", "test-tenant-456") == "new_token_456"
 
     @pytest.mark.asyncio
-    async def test_refresh_handles_no_credentials(self, exporter_with_auth_ref, mock_token_cache):
-        """Test that refresh handles case when auth provider returns no credentials."""
-        from nat.data_models.authentication import AuthResult
+    async def test_ensure_token_for_two_distinct_keys(
+        self, mock_context_state, mock_auth_provider
+    ):
+        """Two separate (agent_id, tenant_id) keys each get their own cache entry."""
+        from datetime import datetime, timedelta, timezone
+        from pydantic import SecretStr
+        from nat.data_models.authentication import AuthResult, BearerTokenCred
+        from nat.data_models.component_ref import AuthenticationRef
+        from nat.plugins.a365.telemetry.register import _AgentTokenCache
 
-        span = create_mock_otel_span(name="test_span")
-        mock_token_cache.is_expiring_soon.return_value = True
+        cache = _AgentTokenCache()
 
+        cred = BearerTokenCred(token=SecretStr("token-for-key"))
         auth_result = Mock(spec=AuthResult)
-        auth_result.credentials = []
-        exporter_with_auth_ref._auth_provider.authenticate.return_value = auth_result
+        auth_result.credentials = [cred]
+        auth_result.token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=60)
+        mock_auth_provider.authenticate.return_value = auth_result
+
+        mock_builder = Mock()
+        mock_builder.get_auth_provider = AsyncMock(return_value=mock_auth_provider)
+
+        with patch("nat.plugins.a365.telemetry.a365_exporter.Agent365Exporter"):
+            exporter = A365OtelExporter(
+                agent_id="agent-A",
+                tenant_id="tenant-A",
+                token_resolver=lambda a, t: cache.get_token(a, t),
+                context_state=mock_context_state,
+                token_cache=cache,
+                auth_ref=AuthenticationRef("test_auth"),
+                builder=mock_builder,
+            )
 
         with patch("nat.builder.context.Context") as mock_context_class:
-            mock_context_instance = Mock()
-            mock_context_instance.user_id = "test_user"
-            mock_context_class.get.return_value = mock_context_instance
-            with patch("nat.plugins.a365.telemetry.a365_exporter.logger") as mock_logger:
-                await exporter_with_auth_ref.export_otel_spans([span])
+            mock_context_class.get.return_value.user_id = "test_user"
+            await exporter._ensure_token_for("agent-A", "tenant-A")
+            await exporter._ensure_token_for("agent-B", "tenant-B")
 
-                # Should log warning but continue
-                mock_logger.warning.assert_called()
-                # Token cache should not be updated
-                mock_token_cache.update_token.assert_not_called()
+        assert ("agent-A", "tenant-A") in exporter._auth_providers
+        assert ("agent-B", "tenant-B") in exporter._auth_providers
+        assert cache.get_token("agent-A", "tenant-A") == "token-for-key"
+        assert cache.get_token("agent-B", "tenant-B") == "token-for-key"
 
-    @pytest.mark.asyncio
-    async def test_refresh_handles_auth_provider_error(self, exporter_with_auth_ref, mock_token_cache):
-        """Test that refresh handles auth provider errors gracefully."""
-        span = create_mock_otel_span(name="test_span")
-        mock_token_cache.is_expiring_soon.return_value = True
 
-        exporter_with_auth_ref._auth_provider.authenticate.side_effect = Exception("Auth failed")
+def test_readable_span_adapter_prefers_turn_identity():
+    """When a turn identity is set, span attributes use it instead of static config."""
+    from microsoft_agents_a365.observability.core.constants import (
+        GEN_AI_AGENT_ID_KEY,
+        TENANT_ID_KEY,
+    )
+    from nat.plugins.a365.turn_context import (
+        A365TurnIdentity,
+        set_turn_identity,
+    )
 
-        with patch("nat.builder.context.Context") as mock_context_class:
-            mock_context_instance = Mock()
-            mock_context_instance.user_id = "test_user"
-            mock_context_class.get.return_value = mock_context_instance
-            with patch("nat.plugins.a365.telemetry.a365_exporter.logger") as mock_logger:
-                await exporter_with_auth_ref.export_otel_spans([span])
+    span = create_mock_otel_span(attributes={})
 
-                # Should log warning but continue
-                mock_logger.warning.assert_called()
-                # Export should still proceed
-                exporter_with_auth_ref._mock_a365_exporter_instance.export.assert_called_once()
+    identity = A365TurnIdentity(
+        agent_app_id="turn-agent",
+        tenant_id="turn-tenant",
+        on_behalf_user_id="user-1",
+    )
+    with set_turn_identity(identity):
+        adapter = _ReadableSpanAdapter(
+            otel_span=span,
+            tenant_id="static-tenant",
+            agent_id="static-agent",
+        )
+
+    assert adapter.attributes[GEN_AI_AGENT_ID_KEY] == "turn-agent"
+    assert adapter.attributes[TENANT_ID_KEY] == "turn-tenant"
+
+
+def test_readable_span_adapter_falls_back_to_static_when_no_turn():
+    """Outside a turn (e.g. CLI workflow), static config is used."""
+    from microsoft_agents_a365.observability.core.constants import (
+        GEN_AI_AGENT_ID_KEY,
+        TENANT_ID_KEY,
+    )
+
+    span = create_mock_otel_span(attributes={})
+    adapter = _ReadableSpanAdapter(
+        otel_span=span,
+        tenant_id="static-tenant",
+        agent_id="static-agent",
+    )
+
+    assert adapter.attributes[GEN_AI_AGENT_ID_KEY] == "static-agent"
+    assert adapter.attributes[TENANT_ID_KEY] == "static-tenant"
+
+
+async def test_export_uses_turn_identity_for_token_lookup():
+    """Span attributes and the token-cache key must use turn-context identity."""
+    from microsoft_agents_a365.observability.core.constants import (
+        GEN_AI_AGENT_ID_KEY,
+        TENANT_ID_KEY,
+    )
+    from nat.plugins.a365.telemetry.register import _AgentTokenCache
+    from nat.plugins.a365.turn_context import (
+        A365TurnIdentity,
+        set_turn_identity,
+    )
+
+    cache = _AgentTokenCache()
+    cache.update_token(
+        "turn-agent",
+        "turn-tenant",
+        token="turn-token",
+        expires_at=None,
+    )
+
+    captured = {}
+
+    def fake_export(readable_spans):
+        captured["spans"] = list(readable_spans)
+        return SpanExportResult.SUCCESS
+
+    with patch(
+        "nat.plugins.a365.telemetry.a365_exporter.Agent365Exporter"
+    ) as mock_exporter_class:
+        mock_exporter_instance = Mock()
+        mock_exporter_instance.export = fake_export
+        mock_exporter_class.return_value = mock_exporter_instance
+
+        exporter = A365OtelExporter(
+            agent_id="static-agent",
+            tenant_id="static-tenant",
+            token_resolver=lambda a, t: cache.get_token(a, t),
+            token_cache=cache,
+            auth_ref=None,
+            builder=None,
+        )
+
+        identity = A365TurnIdentity(
+            agent_app_id="turn-agent",
+            tenant_id="turn-tenant",
+            on_behalf_user_id="user-1",
+        )
+        with set_turn_identity(identity):
+            await exporter.export_otel_spans([create_mock_otel_span(attributes={})])
+
+    assert "spans" in captured, "Agent365Exporter.export was not called"
+    spans = captured["spans"]
+    assert len(spans) == 1
+    assert spans[0].attributes[GEN_AI_AGENT_ID_KEY] == "turn-agent"
+    assert spans[0].attributes[TENANT_ID_KEY] == "turn-tenant"
