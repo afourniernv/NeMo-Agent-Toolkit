@@ -34,6 +34,10 @@ from nat.plugins.a365.exceptions import (
     A365WorkflowExecutionError,
 )
 from nat.plugins.a365.front_end.front_end_config import A365FrontEndConfig
+from nat.plugins.a365.turn_context import (
+    extract_identity_from_activity,
+    set_turn_identity,
+)
 from nat.runtime.session import SessionManager
 
 if TYPE_CHECKING:
@@ -306,8 +310,10 @@ class A365FrontEndPluginWorker:
                 from nat.data_models.api_server import ChatRequest
                 payload = ChatRequest.from_string(query)
 
-                async with session_manager.run(payload) as runner:
-                    result = await runner.result(to_type=str)
+                identity = extract_identity_from_activity(context.activity)
+                with set_turn_identity(identity):
+                    async with session_manager.run(payload) as runner:
+                        result = await runner.result(to_type=str)
 
                 await context.send_activity(result)
 
@@ -428,8 +434,10 @@ class A365FrontEndPluginWorker:
                 from nat.data_models.api_server import ChatRequest
                 payload = ChatRequest.from_string(query)
 
-                async with session_manager.run(payload) as runner:
-                    result = await runner.result(to_type=str)
+                identity = extract_identity_from_activity(context.activity)
+                with set_turn_identity(identity):
+                    async with session_manager.run(payload) as runner:
+                        result = await runner.result(to_type=str)
 
                 await context.send_activity(result)
 
