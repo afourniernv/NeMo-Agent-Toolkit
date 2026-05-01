@@ -6,14 +6,10 @@
 
 from types import SimpleNamespace
 
-import pytest
-
-from nat.plugins.a365.turn_context import (
-    A365TurnIdentity,
-    extract_identity_from_activity,
-    get_turn_identity,
-    set_turn_identity,
-)
+from nat.plugins.a365.turn_context import A365TurnIdentity
+from nat.plugins.a365.turn_context import extract_identity_from_activity
+from nat.plugins.a365.turn_context import get_turn_identity
+from nat.plugins.a365.turn_context import set_turn_identity
 
 
 def _activity_with_methods(*, app_id, tenant, user, agentic=True):

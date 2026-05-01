@@ -21,7 +21,7 @@ import contextlib
 from collections.abc import Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 _AGENTIC_ROLES = frozenset({"agenticIdentity", "agenticUser"})
 
@@ -31,22 +31,22 @@ class A365TurnIdentity:
     """Identity of the agent serving the current turn."""
 
     agent_app_id: str
-    tenant_id: Optional[str]
-    on_behalf_user_id: Optional[str]
+    tenant_id: str | None
+    on_behalf_user_id: str | None
 
 
-_TURN_IDENTITY: ContextVar[Optional[A365TurnIdentity]] = ContextVar(
+_TURN_IDENTITY: ContextVar[A365TurnIdentity | None] = ContextVar(
     "a365_turn_identity", default=None
 )
 
 
-def get_turn_identity() -> Optional[A365TurnIdentity]:
+def get_turn_identity() -> A365TurnIdentity | None:
     """Return the identity of the current turn, or None if not in a turn."""
     return _TURN_IDENTITY.get()
 
 
 @contextlib.contextmanager
-def set_turn_identity(identity: Optional[A365TurnIdentity]) -> Iterator[None]:
+def set_turn_identity(identity: A365TurnIdentity | None) -> Iterator[None]:
     """Bind ``identity`` for the duration of the with-block, restoring on exit."""
     token = _TURN_IDENTITY.set(identity)
     try:
@@ -71,7 +71,7 @@ def _is_agentic_via_role(activity: Any) -> bool:
     return role in _AGENTIC_ROLES
 
 
-def extract_identity_from_activity(activity: Any) -> Optional[A365TurnIdentity]:
+def extract_identity_from_activity(activity: Any) -> A365TurnIdentity | None:
     """Pull A365 identity from a Microsoft Agents Activity (or duck-typed shape).
 
     Returns None when the activity is not an agentic request, or when no agent
